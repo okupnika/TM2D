@@ -425,6 +425,37 @@ class TransformerV1(nn.Module):
         return trg_seq
 
 
+    def sample_bridge_with_trg_seq_enc_output(self, src_seq, src_non_pad_lens, enc_output, trg_seq,
+                                              bridge_start, bridge_end, trg_sos, trg_eos,
+                                              sample=False, top_k=None, forbid_special=True):
+        """Fill only trg_seq[:, bridge_start:bridge_end] while keeping prefix/suffix tokens fixed."""
+        batch_size, src_seq_len = src_seq.shape[0], src_seq.shape[1]
+        src_mask = get_pad_mask(batch_size, src_seq_len, src_non_pad_lens).to(src_seq.device)
+
+        out_seq = trg_seq.clone()
+        for pos in range(bridge_start, bridge_end):
+            cur_in = out_seq[:, :pos]
+            trg_mask = get_subsequent_mask(cur_in)
+            dec_output, *_ = self.decoder(cur_in, trg_mask, enc_output, src_mask)
+            logits = self.trg_word_prj(dec_output)[:, -1, :]
+
+            if top_k is not None:
+                logits = top_k_logits(logits, top_k)
+            probs = F.softmax(logits, dim=-1)
+
+            if forbid_special:
+                probs[:, [trg_sos, trg_eos, self.trg_pad_idx]] = 0
+                probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-12)
+
+            if sample:
+                next_tok = torch.multinomial(probs, num_samples=1)
+            else:
+                _, next_tok = torch.topk(probs, k=1, dim=-1)
+
+            out_seq[:, pos:pos + 1] = next_tok
+
+        return out_seq
+
     def sample_batch(self, src_seq, src_non_pad_lens, trg_sos, trg_eos, max_steps=80, sample=False, top_k=None):
         trg_seq = torch.LongTensor(src_seq.size(0), 1).fill_(trg_sos).to(src_seq).long()
 

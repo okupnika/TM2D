@@ -424,6 +424,49 @@ class TransformerV2(nn.Module):
         return trg_seq
 
 
+
+    def sample_bridge_with_fixed_ends(self, src_seq, trg_seq, bridge_start, bridge_end, trg_sos, trg_eos,
+                                      sample=False, top_k=None, forbid_special=True):
+        """
+        Autoregressively fill trg_seq[:, bridge_start:bridge_end] while keeping prefix/suffix fixed.
+
+        Args:
+            src_seq: source token sequence used by encoder.
+            trg_seq: target token canvas [B, T]. Prefix [0:bridge_start) and suffix [bridge_end:T) are fixed.
+            bridge_start: inclusive start index of region to generate.
+            bridge_end: exclusive end index of region to generate.
+        """
+        assert bridge_start >= 1, 'bridge_start should keep at least SOS token in prefix.'
+        assert bridge_end <= trg_seq.shape[1], 'bridge_end out of range.'
+        assert bridge_start < bridge_end, 'invalid bridge range.'
+
+        src_mask = get_pad_mask_idx(src_seq, self.src_pad_idx)
+        enc_output, *_ = self.encoder(src_seq, src_mask)
+
+        out_seq = trg_seq.clone()
+        # progressively unlock one token at a time in the bridge region
+        for pos in range(bridge_start, bridge_end):
+            cur_in = out_seq[:, :pos]
+            trg_mask = get_subsequent_mask(cur_in)
+            dec_output, *_ = self.decoder(cur_in, trg_mask, enc_output, src_mask)
+            logits = self.trg_word_prj(dec_output)[:, -1, :]
+
+            if top_k is not None:
+                logits = top_k_logits(logits, top_k)
+            probs = F.softmax(logits, dim=-1)
+
+            if forbid_special:
+                probs[:, [trg_sos, trg_eos, self.trg_pad_idx]] = 0
+                probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-12)
+
+            if sample:
+                next_tok = torch.multinomial(probs, num_samples=1)
+            else:
+                _, next_tok = torch.topk(probs, k=1, dim=-1)
+
+            out_seq[:, pos:pos+1] = next_tok
+
+        return out_seq
     def sample_batch(self, src_seq, trg_sos, trg_eos, max_steps=80, sample=False, top_k=None):
         trg_seq = torch.LongTensor(src_seq.size(0), 1).fill_(trg_sos).to(src_seq).long()
 
